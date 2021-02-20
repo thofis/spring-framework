@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2017 the original author or authors.
+ * Copyright 2002-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,9 +18,11 @@ package org.springframework.test.web.reactive.server;
 
 import java.net.URI;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -28,6 +30,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
+import org.hamcrest.Matcher;
+import org.hamcrest.MatcherAssert;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 
@@ -39,18 +43,21 @@ import org.springframework.http.MediaType;
 import org.springframework.http.client.reactive.ClientHttpConnector;
 import org.springframework.http.client.reactive.ClientHttpRequest;
 import org.springframework.lang.Nullable;
+import org.springframework.test.util.AssertionErrors;
 import org.springframework.test.util.JsonExpectationsHelper;
+import org.springframework.test.util.XmlExpectationsHelper;
 import org.springframework.util.Assert;
+import org.springframework.util.CollectionUtils;
+import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MimeType;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.reactive.function.BodyInserter;
+import org.springframework.web.reactive.function.BodyInserters;
+import org.springframework.web.reactive.function.client.ClientRequest;
 import org.springframework.web.reactive.function.client.ClientResponse;
-import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.ExchangeFunction;
 import org.springframework.web.util.UriBuilder;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.springframework.test.util.AssertionErrors.assertEquals;
-import static org.springframework.test.util.AssertionErrors.assertTrue;
+import org.springframework.web.util.UriBuilderFactory;
 
 /**
  * Default implementation of {@link WebTestClient}.
@@ -60,30 +67,42 @@ import static org.springframework.test.util.AssertionErrors.assertTrue;
  */
 class DefaultWebTestClient implements WebTestClient {
 
-	private final WebClient webClient;
-
 	private final WiretapConnector wiretapConnector;
 
-	private final Duration timeout;
+	private final ExchangeFunction exchangeFunction;
+
+	private final UriBuilderFactory uriBuilderFactory;
+
+	@Nullable
+	private final HttpHeaders defaultHeaders;
+
+	@Nullable
+	private final MultiValueMap<String, String> defaultCookies;
+
+	private final Duration responseTimeout;
 
 	private final DefaultWebTestClientBuilder builder;
 
 	private final AtomicLong requestIndex = new AtomicLong();
 
 
-	DefaultWebTestClient(WebClient.Builder clientBuilder, ClientHttpConnector connector,
-			@Nullable Duration timeout, DefaultWebTestClientBuilder webTestClientBuilder) {
+	DefaultWebTestClient(ClientHttpConnector connector,
+			Function<ClientHttpConnector, ExchangeFunction> exchangeFactory, UriBuilderFactory uriBuilderFactory,
+			@Nullable HttpHeaders headers, @Nullable MultiValueMap<String, String> cookies,
+			@Nullable Duration responseTimeout, DefaultWebTestClientBuilder clientBuilder) {
 
-		Assert.notNull(clientBuilder, "WebClient.Builder is required");
 		this.wiretapConnector = new WiretapConnector(connector);
-		this.webClient = clientBuilder.clientConnector(this.wiretapConnector).build();
-		this.timeout = (timeout != null ? timeout : Duration.ofSeconds(5));
-		this.builder = webTestClientBuilder;
+		this.exchangeFunction = exchangeFactory.apply(this.wiretapConnector);
+		this.uriBuilderFactory = uriBuilderFactory;
+		this.defaultHeaders = headers;
+		this.defaultCookies = cookies;
+		this.responseTimeout = (responseTimeout != null ? responseTimeout : Duration.ofSeconds(5));
+		this.builder = clientBuilder;
 	}
 
 
-	private Duration getTimeout() {
-		return this.timeout;
+	private Duration getResponseTimeout() {
+		return this.responseTimeout;
 	}
 
 
@@ -123,12 +142,12 @@ class DefaultWebTestClient implements WebTestClient {
 	}
 
 	@Override
-	public RequestBodyUriSpec method(HttpMethod method) {
-		return methodInternal(method);
+	public RequestBodyUriSpec method(HttpMethod httpMethod) {
+		return methodInternal(httpMethod);
 	}
 
-	private RequestBodyUriSpec methodInternal(HttpMethod method) {
-		return new DefaultRequestBodyUriSpec(this.webClient.method(method));
+	private RequestBodyUriSpec methodInternal(HttpMethod httpMethod) {
+		return new DefaultRequestBodyUriSpec(httpMethod);
 	}
 
 	@Override
@@ -144,145 +163,241 @@ class DefaultWebTestClient implements WebTestClient {
 
 	private class DefaultRequestBodyUriSpec implements RequestBodyUriSpec {
 
-		private final WebClient.RequestBodyUriSpec bodySpec;
+		private final HttpMethod httpMethod;
+
+		@Nullable
+		private URI uri;
+
+		private final HttpHeaders headers;
+
+		@Nullable
+		private MultiValueMap<String, String> cookies;
+
+		@Nullable
+		private BodyInserter<?, ? super ClientHttpRequest> inserter;
+
+		private final Map<String, Object> attributes = new LinkedHashMap<>(4);
+
+		@Nullable
+		private Consumer<ClientHttpRequest> httpRequestConsumer;
 
 		@Nullable
 		private String uriTemplate;
 
 		private final String requestId;
 
-		DefaultRequestBodyUriSpec(WebClient.RequestBodyUriSpec spec) {
-			this.bodySpec = spec;
+		DefaultRequestBodyUriSpec(HttpMethod httpMethod) {
+			this.httpMethod = httpMethod;
 			this.requestId = String.valueOf(requestIndex.incrementAndGet());
-			this.bodySpec.header(WebTestClient.WEBTESTCLIENT_REQUEST_ID, this.requestId);
+			this.headers = new HttpHeaders();
+			this.headers.add(WebTestClient.WEBTESTCLIENT_REQUEST_ID, this.requestId);
 		}
 
 		@Override
 		public RequestBodySpec uri(String uriTemplate, Object... uriVariables) {
-			this.bodySpec.uri(uriTemplate, uriVariables);
 			this.uriTemplate = uriTemplate;
-			return this;
+			return uri(uriBuilderFactory.expand(uriTemplate, uriVariables));
 		}
 
 		@Override
 		public RequestBodySpec uri(String uriTemplate, Map<String, ?> uriVariables) {
-			this.bodySpec.uri(uriTemplate, uriVariables);
 			this.uriTemplate = uriTemplate;
-			return this;
+			return uri(uriBuilderFactory.expand(uriTemplate, uriVariables));
 		}
 
 		@Override
 		public RequestBodySpec uri(Function<UriBuilder, URI> uriFunction) {
-			this.bodySpec.uri(uriFunction);
 			this.uriTemplate = null;
-			return this;
+			return uri(uriFunction.apply(uriBuilderFactory.builder()));
 		}
 
 		@Override
 		public RequestBodySpec uri(URI uri) {
-			this.bodySpec.uri(uri);
-			this.uriTemplate = null;
+			this.uri = uri;
 			return this;
+		}
+
+		private HttpHeaders getHeaders() {
+			return this.headers;
+		}
+
+		private MultiValueMap<String, String> getCookies() {
+			if (this.cookies == null) {
+				this.cookies = new LinkedMultiValueMap<>(3);
+			}
+			return this.cookies;
 		}
 
 		@Override
 		public RequestBodySpec header(String headerName, String... headerValues) {
-			this.bodySpec.header(headerName, headerValues);
+			for (String headerValue : headerValues) {
+				getHeaders().add(headerName, headerValue);
+			}
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec headers(Consumer<HttpHeaders> headersConsumer) {
-			this.bodySpec.headers(headersConsumer);
+			headersConsumer.accept(getHeaders());
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec attribute(String name, Object value) {
-			this.bodySpec.attribute(name, value);
+			this.attributes.put(name, value);
 			return this;
 		}
 
 		@Override
-		public RequestBodySpec attributes(
-				Consumer<Map<String, Object>> attributesConsumer) {
-			this.bodySpec.attributes(attributesConsumer);
+		public RequestBodySpec attributes(Consumer<Map<String, Object>> attributesConsumer) {
+			attributesConsumer.accept(this.attributes);
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec accept(MediaType... acceptableMediaTypes) {
-			this.bodySpec.accept(acceptableMediaTypes);
+			getHeaders().setAccept(Arrays.asList(acceptableMediaTypes));
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec acceptCharset(Charset... acceptableCharsets) {
-			this.bodySpec.acceptCharset(acceptableCharsets);
+			getHeaders().setAcceptCharset(Arrays.asList(acceptableCharsets));
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec contentType(MediaType contentType) {
-			this.bodySpec.contentType(contentType);
+			getHeaders().setContentType(contentType);
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec contentLength(long contentLength) {
-			this.bodySpec.contentLength(contentLength);
+			getHeaders().setContentLength(contentLength);
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec cookie(String name, String value) {
-			this.bodySpec.cookie(name, value);
+			getCookies().add(name, value);
 			return this;
 		}
 
 		@Override
-		public RequestBodySpec cookies(
-				Consumer<MultiValueMap<String, String>> cookiesConsumer) {
-			this.bodySpec.cookies(cookiesConsumer);
+		public RequestBodySpec cookies(Consumer<MultiValueMap<String, String>> cookiesConsumer) {
+			cookiesConsumer.accept(getCookies());
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec ifModifiedSince(ZonedDateTime ifModifiedSince) {
-			this.bodySpec.ifModifiedSince(ifModifiedSince);
+			getHeaders().setIfModifiedSince(ifModifiedSince);
 			return this;
 		}
 
 		@Override
 		public RequestBodySpec ifNoneMatch(String... ifNoneMatches) {
-			this.bodySpec.ifNoneMatch(ifNoneMatches);
+			getHeaders().setIfNoneMatch(Arrays.asList(ifNoneMatches));
+			return this;
+		}
+
+		@Override
+		public RequestHeadersSpec<?> bodyValue(Object body) {
+			this.inserter = BodyInserters.fromValue(body);
+			return this;
+		}
+
+		@Override
+		public <T, P extends Publisher<T>> RequestHeadersSpec<?> body(
+				P publisher, ParameterizedTypeReference<T> elementTypeRef) {
+			this.inserter = BodyInserters.fromPublisher(publisher, elementTypeRef);
+			return this;
+		}
+
+		@Override
+		public <T, P extends Publisher<T>> RequestHeadersSpec<?> body(P publisher, Class<T> elementClass) {
+			this.inserter = BodyInserters.fromPublisher(publisher, elementClass);
+			return this;
+		}
+
+		@Override
+		public RequestHeadersSpec<?> body(Object producer, Class<?> elementClass) {
+			this.inserter = BodyInserters.fromProducer(producer, elementClass);
+			return this;
+		}
+
+		@Override
+		public RequestHeadersSpec<?> body(Object producer, ParameterizedTypeReference<?> elementTypeRef) {
+			this.inserter = BodyInserters.fromProducer(producer, elementTypeRef);
 			return this;
 		}
 
 		@Override
 		public RequestHeadersSpec<?> body(BodyInserter<?, ? super ClientHttpRequest> inserter) {
-			this.bodySpec.body(inserter);
+			this.inserter = inserter;
 			return this;
 		}
 
 		@Override
-		public <T, S extends Publisher<T>> RequestHeadersSpec<?> body(S publisher, Class<T> elementClass) {
-			this.bodySpec.body(publisher, elementClass);
-			return this;
-		}
-
-		@Override
+		@Deprecated
 		public RequestHeadersSpec<?> syncBody(Object body) {
-			this.bodySpec.syncBody(body);
-			return this;
+			return bodyValue(body);
 		}
 
 		@Override
 		public ResponseSpec exchange() {
-			ClientResponse clientResponse = this.bodySpec.exchange().block(getTimeout());
-			Assert.state(clientResponse != null, "No ClientResponse");
-			WiretapConnector.Info info = wiretapConnector.claimRequest(this.requestId);
-			return new DefaultResponseSpec(info, clientResponse, this.uriTemplate, getTimeout());
+			ClientRequest request = (this.inserter != null ?
+					initRequestBuilder().body(this.inserter).build() :
+					initRequestBuilder().build());
+
+			ClientResponse response = exchangeFunction.exchange(request).block(getResponseTimeout());
+			Assert.state(response != null, "No ClientResponse");
+
+			ExchangeResult result = wiretapConnector.getExchangeResult(
+					this.requestId, this.uriTemplate, getResponseTimeout());
+
+			return new DefaultResponseSpec(result, response, getResponseTimeout());
+		}
+
+		private ClientRequest.Builder initRequestBuilder() {
+			ClientRequest.Builder builder = ClientRequest.create(this.httpMethod, initUri())
+					.headers(headers -> headers.addAll(initHeaders()))
+					.cookies(cookies -> cookies.addAll(initCookies()))
+					.attributes(attributes -> attributes.putAll(this.attributes));
+			if (this.httpRequestConsumer != null) {
+				builder.httpRequest(this.httpRequestConsumer);
+			}
+			return builder;
+		}
+
+		private URI initUri() {
+			return (this.uri != null ? this.uri : uriBuilderFactory.expand(""));
+		}
+
+		private HttpHeaders initHeaders() {
+			if (CollectionUtils.isEmpty(defaultHeaders)) {
+				return this.headers;
+			}
+			HttpHeaders result = new HttpHeaders();
+			result.putAll(defaultHeaders);
+			result.putAll(this.headers);
+			return result;
+		}
+
+		private MultiValueMap<String, String> initCookies() {
+			if (CollectionUtils.isEmpty(this.cookies)) {
+				return (defaultCookies != null ? defaultCookies : new LinkedMultiValueMap<>());
+			}
+			else if (CollectionUtils.isEmpty(defaultCookies)) {
+				return this.cookies;
+			}
+			else {
+				MultiValueMap<String, String> result = new LinkedMultiValueMap<>();
+				result.putAll(defaultCookies);
+				result.putAll(this.cookies);
+				return result;
+			}
 		}
 	}
 
@@ -296,10 +411,8 @@ class DefaultWebTestClient implements WebTestClient {
 		private final Duration timeout;
 
 
-		DefaultResponseSpec(WiretapConnector.Info wiretapInfo, ClientResponse response,
-				@Nullable String uriTemplate, Duration timeout) {
-
-			this.exchangeResult = wiretapInfo.createExchangeResult(uriTemplate);
+		DefaultResponseSpec(ExchangeResult exchangeResult, ClientResponse response, Duration timeout) {
+			this.exchangeResult = exchangeResult;
 			this.response = response;
 			this.timeout = timeout;
 		}
@@ -312,6 +425,11 @@ class DefaultWebTestClient implements WebTestClient {
 		@Override
 		public HeaderAssertions expectHeader() {
 			return new HeaderAssertions(this.exchangeResult, this);
+		}
+
+		@Override
+		public CookieAssertions expectCookie() {
+			return new CookieAssertions(this.exchangeResult, this);
 		}
 
 		@Override
@@ -354,15 +472,22 @@ class DefaultWebTestClient implements WebTestClient {
 		}
 
 		@Override
-		public <T> FluxExchangeResult<T> returnResult(Class<T> elementType) {
-			Flux<T> body = this.response.bodyToFlux(elementType);
-			return new FluxExchangeResult<>(this.exchangeResult, body, this.timeout);
+		public <T> FluxExchangeResult<T> returnResult(Class<T> elementClass) {
+			Flux<T> body;
+			if (elementClass.equals(Void.class)) {
+				this.response.releaseBody().block();
+				body = Flux.empty();
+			}
+			else {
+				body = this.response.bodyToFlux(elementClass);
+			}
+			return new FluxExchangeResult<>(this.exchangeResult, body);
 		}
 
 		@Override
-		public <T> FluxExchangeResult<T> returnResult(ParameterizedTypeReference<T> elementType) {
-			Flux<T> body = this.response.bodyToFlux(elementType);
-			return new FluxExchangeResult<>(this.exchangeResult, body, this.timeout);
+		public <T> FluxExchangeResult<T> returnResult(ParameterizedTypeReference<T> elementTypeRef) {
+			Flux<T> body = this.response.bodyToFlux(elementTypeRef);
+			return new FluxExchangeResult<>(this.exchangeResult, body);
 		}
 	}
 
@@ -382,7 +507,28 @@ class DefaultWebTestClient implements WebTestClient {
 		@Override
 		public <T extends S> T isEqualTo(B expected) {
 			this.result.assertWithDiagnostics(() ->
-					assertEquals("Response body", expected, this.result.getResponseBody()));
+					AssertionErrors.assertEquals("Response body", expected, this.result.getResponseBody()));
+			return self();
+		}
+
+		@Override
+		public <T extends S> T value(Matcher<? super B> matcher) {
+			this.result.assertWithDiagnostics(() -> MatcherAssert.assertThat(this.result.getResponseBody(), matcher));
+			return self();
+		}
+
+		@Override
+		public <T extends S, R> T value(Function<B, R> bodyMapper, Matcher<? super R> matcher) {
+			this.result.assertWithDiagnostics(() -> {
+				B body = this.result.getResponseBody();
+				MatcherAssert.assertThat(bodyMapper.apply(body), matcher);
+			});
+			return self();
+		}
+
+		@Override
+		public <T extends S> T value(Consumer<B> consumer) {
+			this.result.assertWithDiagnostics(() -> consumer.accept(this.result.getResponseBody()));
 			return self();
 		}
 
@@ -415,7 +561,8 @@ class DefaultWebTestClient implements WebTestClient {
 		public ListBodySpec<E> hasSize(int size) {
 			List<E> actual = getResult().getResponseBody();
 			String message = "Response body does not contain " + size + " elements";
-			getResult().assertWithDiagnostics(() -> assertEquals(message, size, (actual != null ? actual.size() : 0)));
+			getResult().assertWithDiagnostics(() ->
+					AssertionErrors.assertEquals(message, size, (actual != null ? actual.size() : 0)));
 			return this;
 		}
 
@@ -425,7 +572,8 @@ class DefaultWebTestClient implements WebTestClient {
 			List<E> expected = Arrays.asList(elements);
 			List<E> actual = getResult().getResponseBody();
 			String message = "Response body does not contain " + expected;
-			getResult().assertWithDiagnostics(() -> assertTrue(message, (actual != null && actual.containsAll(expected))));
+			getResult().assertWithDiagnostics(() ->
+					AssertionErrors.assertTrue(message, (actual != null && actual.containsAll(expected))));
 			return this;
 		}
 
@@ -435,7 +583,8 @@ class DefaultWebTestClient implements WebTestClient {
 			List<E> expected = Arrays.asList(elements);
 			List<E> actual = getResult().getResponseBody();
 			String message = "Response body should not have contained " + expected;
-			getResult().assertWithDiagnostics(() -> assertTrue(message, (actual == null || !actual.containsAll(expected))));
+			getResult().assertWithDiagnostics(() ->
+					AssertionErrors.assertTrue(message, (actual == null || !actual.containsAll(expected))));
 			return this;
 		}
 
@@ -454,12 +603,13 @@ class DefaultWebTestClient implements WebTestClient {
 
 		DefaultBodyContentSpec(EntityExchangeResult<byte[]> result) {
 			this.result = result;
-			this.isEmpty = (result.getResponseBody() == null);
+			this.isEmpty = (result.getResponseBody() == null || result.getResponseBody().length == 0);
 		}
 
 		@Override
 		public EntityExchangeResult<Void> isEmpty() {
-			this.result.assertWithDiagnostics(() -> assertTrue("Expected empty body", this.isEmpty));
+			this.result.assertWithDiagnostics(() ->
+					AssertionErrors.assertTrue("Expected empty body", this.isEmpty));
 			return new EntityExchangeResult<>(this.result, null);
 		}
 
@@ -477,8 +627,26 @@ class DefaultWebTestClient implements WebTestClient {
 		}
 
 		@Override
+		public BodyContentSpec xml(String expectedXml) {
+			this.result.assertWithDiagnostics(() -> {
+				try {
+					new XmlExpectationsHelper().assertXmlEqual(expectedXml, getBodyAsString());
+				}
+				catch (Exception ex) {
+					throw new AssertionError("XML parsing error", ex);
+				}
+			});
+			return this;
+		}
+
+		@Override
 		public JsonPathAssertions jsonPath(String expression, Object... args) {
 			return new JsonPathAssertions(this, getBodyAsString(), expression, args);
+		}
+
+		@Override
+		public XpathAssertions xpath(String expression, @Nullable Map<String, String> namespaces, Object... args) {
+			return new XpathAssertions(this, expression, namespaces, args);
 		}
 
 		private String getBodyAsString() {
@@ -486,8 +654,8 @@ class DefaultWebTestClient implements WebTestClient {
 			if (body == null || body.length == 0) {
 				return "";
 			}
-			MediaType mediaType = this.result.getResponseHeaders().getContentType();
-			Charset charset = Optional.ofNullable(mediaType).map(MimeType::getCharset).orElse(UTF_8);
+			Charset charset = Optional.ofNullable(this.result.getResponseHeaders().getContentType())
+					.map(MimeType::getCharset).orElse(StandardCharsets.UTF_8);
 			return new String(body, charset);
 		}
 

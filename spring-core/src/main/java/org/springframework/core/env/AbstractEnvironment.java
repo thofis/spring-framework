@@ -1,11 +1,11 @@
 /*
- * Copyright 2002-2017 the original author or authors.
+ * Copyright 2002-2021 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ *      https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +17,7 @@
 package org.springframework.core.env;
 
 import java.security.AccessControlException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -106,10 +107,9 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 
 	private final Set<String> defaultProfiles = new LinkedHashSet<>(getReservedDefaultProfiles());
 
-	private final MutablePropertySources propertySources = new MutablePropertySources(this.logger);
+	private final MutablePropertySources propertySources;
 
-	private final ConfigurablePropertyResolver propertyResolver =
-			new PropertySourcesPropertyResolver(this.propertySources);
+	private final ConfigurablePropertyResolver propertyResolver;
 
 
 	/**
@@ -120,12 +120,44 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 	 * @see #customizePropertySources(MutablePropertySources)
 	 */
 	public AbstractEnvironment() {
-		customizePropertySources(this.propertySources);
-		if (logger.isDebugEnabled()) {
-			logger.debug("Initialized " + getClass().getSimpleName() + " with PropertySources " + this.propertySources);
-		}
+		this(new MutablePropertySources());
 	}
 
+	/**
+	 * Create a new {@code Environment} instance with a specific
+	 * {@link MutablePropertySources} instance, calling back to
+	 * {@link #customizePropertySources(MutablePropertySources)} during
+	 * construction to allow subclasses to contribute or manipulate
+	 * {@link PropertySource} instances as appropriate.
+	 * @since 5.3.4
+	 * @see #customizePropertySources(MutablePropertySources)
+	 */
+	protected AbstractEnvironment(MutablePropertySources propertySources) {
+		this.propertySources = propertySources;
+		this.propertyResolver = createPropertyResolver(propertySources);
+		customizePropertySources(propertySources);
+	}
+
+
+	/**
+	 * Factory method used to create the {@link ConfigurablePropertyResolver}
+	 * instance used by the Environment.
+	 * @since 5.3.4
+	 * @see #getPropertyResolver()
+	 */
+	protected ConfigurablePropertyResolver createPropertyResolver(MutablePropertySources propertySources) {
+		return new PropertySourcesPropertyResolver(propertySources);
+	}
+
+	/**
+	 * Return the {@link ConfigurablePropertyResolver} being used by the
+	 * {@link Environment}.
+	 * @since 5.3.4
+	 * @see #createPropertyResolver(MutablePropertySources)
+	 */
+	protected final ConfigurablePropertyResolver getPropertyResolver() {
+		return this.propertyResolver;
+	}
 
 	/**
 	 * Customize the set of {@link PropertySource} objects to be searched by this
@@ -229,15 +261,15 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 	/**
 	 * Return the set of active profiles as explicitly set through
 	 * {@link #setActiveProfiles} or if the current set of active profiles
-	 * is empty, check for the presence of the {@value #ACTIVE_PROFILES_PROPERTY_NAME}
-	 * property and assign its value to the set of active profiles.
+	 * is empty, check for the presence of {@link #doGetActiveProfilesProperty()}
+	 * and assign its value to the set of active profiles.
 	 * @see #getActiveProfiles()
-	 * @see #ACTIVE_PROFILES_PROPERTY_NAME
+	 * @see #doGetActiveProfilesProperty()
 	 */
 	protected Set<String> doGetActiveProfiles() {
 		synchronized (this.activeProfiles) {
 			if (this.activeProfiles.isEmpty()) {
-				String profiles = getProperty(ACTIVE_PROFILES_PROPERTY_NAME);
+				String profiles = doGetActiveProfilesProperty();
 				if (StringUtils.hasText(profiles)) {
 					setActiveProfiles(StringUtils.commaDelimitedListToStringArray(
 							StringUtils.trimAllWhitespace(profiles)));
@@ -247,9 +279,22 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 		}
 	}
 
+	/**
+	 * Return the property value for the active profiles.
+	 * @since 5.3.4
+	 * @see #ACTIVE_PROFILES_PROPERTY_NAME
+	 */
+	@Nullable
+	protected String doGetActiveProfilesProperty() {
+		return getProperty(ACTIVE_PROFILES_PROPERTY_NAME);
+	}
+
 	@Override
 	public void setActiveProfiles(String... profiles) {
 		Assert.notNull(profiles, "Profile array must not be null");
+		if (logger.isDebugEnabled()) {
+			logger.debug("Activating profiles " + Arrays.asList(profiles));
+		}
 		synchronized (this.activeProfiles) {
 			this.activeProfiles.clear();
 			for (String profile : profiles) {
@@ -281,18 +326,17 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 	 * Return the set of default profiles explicitly set via
 	 * {@link #setDefaultProfiles(String...)} or if the current set of default profiles
 	 * consists only of {@linkplain #getReservedDefaultProfiles() reserved default
-	 * profiles}, then check for the presence of the
-	 * {@value #DEFAULT_PROFILES_PROPERTY_NAME} property and assign its value (if any)
-	 * to the set of default profiles.
+	 * profiles}, then check for the presence of {@link #doGetActiveProfilesProperty()}
+	 * and assign its value (if any) to the set of default profiles.
 	 * @see #AbstractEnvironment()
 	 * @see #getDefaultProfiles()
-	 * @see #DEFAULT_PROFILES_PROPERTY_NAME
 	 * @see #getReservedDefaultProfiles()
+	 * @see #doGetDefaultProfilesProperty()
 	 */
 	protected Set<String> doGetDefaultProfiles() {
 		synchronized (this.defaultProfiles) {
 			if (this.defaultProfiles.equals(getReservedDefaultProfiles())) {
-				String profiles = getProperty(DEFAULT_PROFILES_PROPERTY_NAME);
+				String profiles = doGetDefaultProfilesProperty();
 				if (StringUtils.hasText(profiles)) {
 					setDefaultProfiles(StringUtils.commaDelimitedListToStringArray(
 							StringUtils.trimAllWhitespace(profiles)));
@@ -300,6 +344,16 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 			}
 			return this.defaultProfiles;
 		}
+	}
+
+	/**
+	 * Return the property value for the default profiles.
+	 * @since 5.3.4
+	 * @see #DEFAULT_PROFILES_PROPERTY_NAME
+	 */
+	@Nullable
+	protected String doGetDefaultProfilesProperty() {
+		return getProperty(DEFAULT_PROFILES_PROPERTY_NAME);
 	}
 
 	/**
@@ -323,6 +377,7 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 	}
 
 	@Override
+	@Deprecated
 	public boolean acceptsProfiles(String... profiles) {
 		Assert.notEmpty(profiles, "Must specify at least one profile");
 		for (String profile : profiles) {
@@ -336,6 +391,12 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 			}
 		}
 		return false;
+	}
+
+	@Override
+	public boolean acceptsProfiles(Profiles profiles) {
+		Assert.notNull(profiles, "Profiles must not be null");
+		return profiles.matches(this::isProfileActive);
 	}
 
 	/**
@@ -375,7 +436,33 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 	}
 
 	@Override
-	@SuppressWarnings({"unchecked", "rawtypes"})
+	@SuppressWarnings({"rawtypes", "unchecked"})
+	public Map<String, Object> getSystemProperties() {
+		try {
+			return (Map) System.getProperties();
+		}
+		catch (AccessControlException ex) {
+			return (Map) new ReadOnlySystemAttributesMap() {
+				@Override
+				@Nullable
+				protected String getSystemAttribute(String attributeName) {
+					try {
+						return System.getProperty(attributeName);
+					}
+					catch (AccessControlException ex) {
+						if (logger.isInfoEnabled()) {
+							logger.info("Caught AccessControlException when accessing system property '" +
+									attributeName + "'; its value will be returned [null]. Reason: " + ex.getMessage());
+						}
+						return null;
+					}
+				}
+			};
+		}
+	}
+
+	@Override
+	@SuppressWarnings({"rawtypes", "unchecked"})
 	public Map<String, Object> getSystemEnvironment() {
 		if (suppressGetenvAccess()) {
 			return Collections.emptyMap();
@@ -419,32 +506,6 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 	}
 
 	@Override
-	@SuppressWarnings({"unchecked", "rawtypes"})
-	public Map<String, Object> getSystemProperties() {
-		try {
-			return (Map) System.getProperties();
-		}
-		catch (AccessControlException ex) {
-			return (Map) new ReadOnlySystemAttributesMap() {
-				@Override
-				@Nullable
-				protected String getSystemAttribute(String attributeName) {
-					try {
-						return System.getProperty(attributeName);
-					}
-					catch (AccessControlException ex) {
-						if (logger.isInfoEnabled()) {
-							logger.info("Caught AccessControlException when accessing system property '" +
-									attributeName + "'; its value will be returned [null]. Reason: " + ex.getMessage());
-						}
-						return null;
-					}
-				}
-			};
-		}
-	}
-
-	@Override
 	public void merge(ConfigurableEnvironment parent) {
 		for (PropertySource<?> ps : parent.getPropertySources()) {
 			if (!this.propertySources.contains(ps.getName())) {
@@ -454,18 +515,14 @@ public abstract class AbstractEnvironment implements ConfigurableEnvironment {
 		String[] parentActiveProfiles = parent.getActiveProfiles();
 		if (!ObjectUtils.isEmpty(parentActiveProfiles)) {
 			synchronized (this.activeProfiles) {
-				for (String profile : parentActiveProfiles) {
-					this.activeProfiles.add(profile);
-				}
+				Collections.addAll(this.activeProfiles, parentActiveProfiles);
 			}
 		}
 		String[] parentDefaultProfiles = parent.getDefaultProfiles();
 		if (!ObjectUtils.isEmpty(parentDefaultProfiles)) {
 			synchronized (this.defaultProfiles) {
 				this.defaultProfiles.remove(RESERVED_DEFAULT_PROFILE_NAME);
-				for (String profile : parentDefaultProfiles) {
-					this.defaultProfiles.add(profile);
-				}
+				Collections.addAll(this.defaultProfiles, parentDefaultProfiles);
 			}
 		}
 	}
